@@ -1,0 +1,190 @@
+#!/usr/bin/env python
+import sys
+import os
+import re
+import uuid
+import subprocess
+import logging
+import cStringIO
+import pycurl
+import json
+import base64
+import yaml
+import getpass
+from optparse import OptionParser
+
+LOG = logging.getLogger(__name__)
+
+# Define server settings
+GERRIT_URL = 'https://git'
+GIT = 'git'
+
+# Expand server settings
+GERRIT_CHANGES = GERRIT_URL + '/a/changes/'
+
+
+def get_credentials(cache_file='~/.review-credentials'):
+    """
+    Get credentials
+
+    If the credentials cannot be found, create one.
+    """
+    try:
+        f_obj = open(cache_file, 'r')
+        cred = yaml.load(f_obj)
+        username = base64.b64decode(cred['Username'])
+        password = base64.b64decode(cred['Password'])
+        f_obj.close()
+    except:
+        server = raw_input('Gerrit Server: ')
+        username = raw_input('Username: ')
+        password = getpass.getpass('Password: ')
+        cache = raw_input('Cache Username/Password? [Ny]')
+        if cache.lower() == 'y' or cache.lower() == 'yes':
+            file_descriptor = os.open(cache_file, os.O_WRONLY |
+                                      os.O_CREAT, 0600)
+            f_obj = os.fdopen(file_descriptor, 'w')
+            f_obj.write(yaml.dump({'Username':
+                                   base64.b64encode(username),
+                                   'Password':
+                                   base64.b64encode(password)},
+                                  default_flow_style=False))
+            f_obj.close()
+    return username, password
+
+
+def get_change_id(issueKey, username, password, gerrit_url):
+    """
+    Gets the change ID for a issuekey, if one exists.
+    """
+
+    # Update Gerrit Feed
+    buf = cStringIO.StringIO()
+    curl = pycurl.Curl()
+    curl.setopt(curl.URL, gerrit_url + '?q=status:open+owner:self')
+    curl.setopt(curl.HTTPHEADER, ['Accept: application/json'])
+    curl.setopt(curl.USERPWD, str('%s:%s' % (username, password)))
+    curl.setopt(curl.WRITEFUNCTION, buf.write)
+    curl.setopt(curl.SSL_VERIFYPEER, False)
+    curl.perform()
+
+    json_data = buf.getvalue()
+    buf.close()
+
+    if json_data.lower() == 'not found':
+        print 'Error: Could not communicate with gerrit rest API.'
+        sys.exit(-1)
+    elif json_data.lower() == 'unauthorized':
+        print('Error: Could not authorize user with gerrit rest API.  If you '
+              'have recently changed your password, please remove '
+              '.review-credentials from your home directory and try again.')
+        sys.exit(-1)
+    data = json.loads(json_data[4:])
+
+    reviews = {}
+    for review in data:
+        reviews[str(review["_number"])] = review
+    for key in reviews.keys():
+        if re.search(issueKey, reviews[key]["subject"]):
+            return reviews[key]["change_id"]
+    return None
+
+
+def generate_gerrit_changeid():
+    """
+    Generate a unique gerrit commit id
+    """
+    hash_list = []
+    try:
+        for key, value in [('tree', [GIT, 'write-tree']),
+                           ('parent', [GIT, 'rev-parse', '"HEAD^0"']),
+                           ('author', [GIT, 'var', 'GIT_AUTHOR_IDENT']),
+                           ('author', [GIT, 'var', 'GIT_COMMITTER_IDENT'])]:
+            with open(os.devnull, 'w') as devnull:
+                hash_list.append('%s %s\n' % (key, subprocess.check_output(
+                    value, stderr=devnull)))
+        return 'I' + subprocess.check_output(
+            'echo "%s" | %s hash-object -t commit --stdin' % (
+                ''.join(hash_list), GIT), shell=True)
+    except:
+        LOG.fatal("Unable to generate gerrit id")
+        sys.exit(-1)
+
+# Get user options
+PARSER = OptionParser(description='SEG Push for Review Script')
+PARSER.add_option('-s', '--skip-verification',
+                  action='store_true',
+                  default=False,
+                  help='skip credential verification')
+PARSER.add_option('-m', '--message',
+                  metavar='<msg>',
+                  help='Use the given <msg> as the commit message')
+ARGS = PARSER.parse_args()[0]
+SKIP_VERIFICATION = ARGS.skip_verification
+MESSAGE = ARGS.message
+
+# Start with a true status flag, if any system call fails, set this to false.
+STATUS = True
+
+# Before we even get started, lets make sure there are no modified, added, or
+# deleted files in the index.
+try:
+    RC, OUTPUT = subprocess.check_output([GIT, 'status', '-z'])
+except subprocess.CalledProcessError:
+    RC = 1
+    OUTPUT = ''
+TOKEN = re.search(r'([MADCRU])[MADCRU ] .*?\x00', OUTPUT)
+if RC or TOKEN:
+    LOG.fatal("You have staged files.  Please commit or stash "
+              "them before submitting a review.\n")
+    sys.exit(-1)
+
+# Get Credentials
+USERNAME, PASSWORD = get_credentials(ADDRESS, CACHE_FILE)
+
+# Get the Change ID for this issuekey, or generate one
+CHANGE_ID = get_change_id(
+    ISSUEKEY, USERNAME, PASSWORD,
+    GERRIT_URL) or generate_gerrit_changeid()
+
+# Now we have all the information we need, let's start making calls to git.
+# We are using uuid to generate a unique string which will be our squash branch
+# name.
+SQUASH_BRANCH = str(uuid.uuid4())
+
+# Checkout the squash branch, this command will do it's own error checking
+RC, OUTPUT = systemcommand('&&'.join(
+    ['git fetch',
+     'git checkout -b %s origin/master' % SQUASH_BRANCH]))
+if RC:
+    STATUS = False
+    sys.stdout.write(OUTPUT)
+
+# Merge the feature branch into the squash branch
+if STATUS:
+    RC, OUTPUT = systemcommand('&&'.join(
+        ['git merge --squash %s' % BRANCH_NAME,
+         'git commit -n -m "%s %s\n\nIssue: %s\nChange-Id: %s\n\n"' % (
+             ISSUEKEY, SUMMARY, ISSUEKEY, CHANGE_ID)]))
+    if RC:
+        # Reset the branch so that we can get out later.
+        systemcommand('git reset --hard HEAD')
+        STATUS = False
+        sys.stdout.write("ERROR: Could not merge with master.\n%s" % OUTPUT)
+
+# Submit for review
+if STATUS:
+    RC, PUSH_OUTPUT = systemcommand('git push origin HEAD:refs/for/master')
+    if RC:
+        STATUS = False
+        sys.stdout.write("ERROR: Could not push for review.\n%s" % PUSH_OUTPUT)
+
+# No matter what happens, restore the original branch and delete the squash
+# branch.
+RC, OUTPUT = systemcommand('&&'.join(
+    ['git checkout %s' % BRANCH_NAME,
+     'git branch -D %s' % SQUASH_BRANCH]))
+
+# Print the review details and do a happy dance, we are done.
+if STATUS:
+    sys.stdout.write(PUSH_OUTPUT)

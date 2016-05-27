@@ -11,16 +11,13 @@ import json
 import base64
 import yaml
 import getpass
+import distutils.spawn
 from optparse import OptionParser
 
 LOG = logging.getLogger(__name__)
 
 # Define server settings
-GERRIT_URL = 'https://git'
-GIT = 'git'
-
-# Expand server settings
-GERRIT_CHANGES = GERRIT_URL + '/a/changes/'
+GIT = distutils.spawn.find_executable('git')
 
 
 def get_credentials(cache_file='~/.review-credentials'):
@@ -32,6 +29,7 @@ def get_credentials(cache_file='~/.review-credentials'):
     try:
         f_obj = open(cache_file, 'r')
         cred = yaml.load(f_obj)
+        server = base64.b64decode(cred['Server'])
         username = base64.b64decode(cred['Username'])
         password = base64.b64decode(cred['Password'])
         f_obj.close()
@@ -44,16 +42,18 @@ def get_credentials(cache_file='~/.review-credentials'):
             file_descriptor = os.open(cache_file, os.O_WRONLY |
                                       os.O_CREAT, 0600)
             f_obj = os.fdopen(file_descriptor, 'w')
-            f_obj.write(yaml.dump({'Username':
+            f_obj.write(yaml.dump({'Server':
+                                   base64.b64encode(server),
+                                   'Username':
                                    base64.b64encode(username),
                                    'Password':
                                    base64.b64encode(password)},
                                   default_flow_style=False))
             f_obj.close()
-    return username, password
+    return server, username, password
 
 
-def get_change_id(issueKey, username, password, gerrit_url):
+def get_change_id(subject, username, password, gerrit_url):
     """
     Gets the change ID for a issuekey, if one exists.
     """
@@ -85,7 +85,7 @@ def get_change_id(issueKey, username, password, gerrit_url):
     for review in data:
         reviews[str(review["_number"])] = review
     for key in reviews.keys():
-        if re.search(issueKey, reviews[key]["subject"]):
+        if reviews[key]['subject'] == subject:
             return reviews[key]["change_id"]
     return None
 
@@ -129,7 +129,8 @@ STATUS = True
 # Before we even get started, lets make sure there are no modified, added, or
 # deleted files in the index.
 try:
-    RC, OUTPUT = subprocess.check_output([GIT, 'status', '-z'])
+    RC = 0
+    OUTPUT = subprocess.check_output([GIT, 'status', '-z'])
 except subprocess.CalledProcessError:
     RC = 1
     OUTPUT = ''
@@ -140,12 +141,12 @@ if RC or TOKEN:
     sys.exit(-1)
 
 # Get Credentials
-USERNAME, PASSWORD = get_credentials(ADDRESS, CACHE_FILE)
+SERVER, USERNAME, PASSWORD = get_credentials()
 
 # Get the Change ID for this issuekey, or generate one
 CHANGE_ID = get_change_id(
-    ISSUEKEY, USERNAME, PASSWORD,
-    GERRIT_URL) or generate_gerrit_changeid()
+    MESSAGE, USERNAME, PASSWORD,
+    SERVER + '/a/changes/') or generate_gerrit_changeid()
 
 # Now we have all the information we need, let's start making calls to git.
 # We are using uuid to generate a unique string which will be our squash branch
@@ -153,37 +154,62 @@ CHANGE_ID = get_change_id(
 SQUASH_BRANCH = str(uuid.uuid4())
 
 # Checkout the squash branch, this command will do it's own error checking
-RC, OUTPUT = systemcommand('&&'.join(
-    ['git fetch',
-     'git checkout -b %s origin/master' % SQUASH_BRANCH]))
+try:
+    RC = 0
+    OUTPUT = subprocess.check_output('&&'.join(
+        ['git fetch',
+         'git checkout -b %s origin/master' % SQUASH_BRANCH]), shell=True)
+except subprocess.CalledProcessError:
+    RC = 1
+    OUTPUT = ''
 if RC:
     STATUS = False
     sys.stdout.write(OUTPUT)
 
+# Get the current branch name
+try:
+    OUTPUT = subprocess.check_output('git rev-parse --abbrev-ref HEAD',
+                                     shell=True)
+except subprocess.CalledProcessError:
+    print 'ERROR: Could not determine current branch name'
+    sys.exit(-1)
+BRANCH_NAME = OUTPUT.strip()
+
 # Merge the feature branch into the squash branch
 if STATUS:
-    RC, OUTPUT = systemcommand('&&'.join(
-        ['git merge --squash %s' % BRANCH_NAME,
-         'git commit -n -m "%s %s\n\nIssue: %s\nChange-Id: %s\n\n"' % (
-             ISSUEKEY, SUMMARY, ISSUEKEY, CHANGE_ID)]))
+    try:
+        RC = 0
+        OUTPUT = subprocess.check_output('&&'.join(
+            ['git merge --squash %s' % BRANCH_NAME,
+             'git commit -n -m "%s\n\nChange-Id: %s\n\n"' % (
+                 MESSAGE, CHANGE_ID)]), shell=True)
+    except:
+        RC = 1
+        OUTPUT = ''
     if RC:
         # Reset the branch so that we can get out later.
-        systemcommand('git reset --hard HEAD')
+        subprocess.call('git reset --hard HEAD', shell=True)
         STATUS = False
         sys.stdout.write("ERROR: Could not merge with master.\n%s" % OUTPUT)
 
 # Submit for review
 if STATUS:
-    RC, PUSH_OUTPUT = systemcommand('git push origin HEAD:refs/for/master')
+    try:
+        RC = 0
+        PUSH_OUTPUT = subprocess.check_output(
+            'git push origin HEAD:refs/for/master')
+    except subprocess.CalledProcessError:
+        RC = 1
+        PUSH_OUTPUT = ''
     if RC:
         STATUS = False
         sys.stdout.write("ERROR: Could not push for review.\n%s" % PUSH_OUTPUT)
 
 # No matter what happens, restore the original branch and delete the squash
 # branch.
-RC, OUTPUT = systemcommand('&&'.join(
+subprocess.call('&&'.join(
     ['git checkout %s' % BRANCH_NAME,
-     'git branch -D %s' % SQUASH_BRANCH]))
+     'git branch -D %s' % SQUASH_BRANCH]), shell=True)
 
 # Print the review details and do a happy dance, we are done.
 if STATUS:
